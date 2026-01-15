@@ -1,5 +1,7 @@
 require("dotenv").config();
 const Discord = require("discord.js");
+const fs = require("fs");
+const path = require("path");
 
 const client = new Discord.Client({
   intents: ["GUILDS", "GUILD_MEMBERS", "GUILD_MESSAGES"],
@@ -19,6 +21,11 @@ const RESERVE_BY_METHOD_MS = {
 
 const COOLDOWN_MS = 3000;
 const RENAME_CHANNEL_ON_PAID = true;
+
+// Vouches settings
+const VOUCHES_FILE = path.join(__dirname, "vouches.json");
+const VOUCH_COMMENT_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes to type comment
+const MAX_VOUCH_COMMENT_LEN = 250; // keep it clean & short
 
 // ======================
 // CATALOG (EDIT HERE)
@@ -66,12 +73,15 @@ const channelOrder = new Map();
 // stockRemaining key = `${shopKey}:${itemId}` -> number
 const stockRemaining = new Map();
 
+// vouch pending: userId -> { stars, channelId, expiresAt }
+const pendingVouch = new Map();
+
 // ======================
 // Helpers
 // ======================
 function mustEnv(name) {
   const v = process.env[name];
-  if (!v) console.warn(`⚠️ Missing in .env: ${name}`);
+  if (!v) console.warn(`⚠️ Missing in Secrets/.env: ${name}`);
   return v;
 }
 
@@ -166,6 +176,49 @@ function remainingMs(ts) {
   return Math.max(0, ts - Date.now());
 }
 
+function isStaffMember(member) {
+  const staffRoleId = process.env.STAFF_ROLE_ID;
+  return !!(staffRoleId && member?.roles?.cache?.has(staffRoleId));
+}
+
+function starsLine(n) {
+  const full = "⭐".repeat(Math.max(0, Math.min(5, n)));
+  const empty = "☆".repeat(5 - Math.max(0, Math.min(5, n)));
+  return full + empty;
+}
+
+function randRef(len = 4) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+// ======================
+// VOUCHES (ANONYMOUS JSON)
+// ======================
+function ensureVouchesFile() {
+  try {
+    if (!fs.existsSync(VOUCHES_FILE)) fs.writeFileSync(VOUCHES_FILE, "[]", "utf8");
+  } catch {}
+}
+function loadVouches() {
+  try {
+    ensureVouchesFile();
+    const raw = fs.readFileSync(VOUCHES_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+function saveVouches(list) {
+  try {
+    ensureVouchesFile();
+    fs.writeFileSync(VOUCHES_FILE, JSON.stringify(list, null, 2), "utf8");
+  } catch {}
+}
+
 // ======================
 // UI Components
 // ======================
@@ -174,6 +227,13 @@ function mainMenuRow() {
     new Discord.MessageButton().setCustomId("buy_bloodlines").setLabel("🩸 Bloodlines").setStyle("DANGER"),
     new Discord.MessageButton().setCustomId("buy_gpo").setLabel("🌊 Grand Piece Online").setStyle("PRIMARY"),
     new Discord.MessageButton().setCustomId("call_staff").setLabel("🆘 Contact Support").setStyle("SUCCESS")
+  );
+}
+
+function infoRow() {
+  return new Discord.MessageActionRow().addComponents(
+    new Discord.MessageButton().setCustomId("shidenn_about").setLabel("📌 What is Shidenn Store?").setStyle("SECONDARY"),
+    new Discord.MessageButton().setCustomId("shidenn_vouches").setLabel("⭐ View Vouches").setStyle("SUCCESS")
   );
 }
 
@@ -230,7 +290,9 @@ function itemSelectRow(shopKey, selectedItemId, disabled = false) {
     return {
       label: it.name,
       value: it.id,
-      description: `Stock: ${remaining} | ${formatBRL(final)}${disc > 0 ? ` (-${disc}%)` : ""}${it.popular ? " | MOST POPULAR" : ""}`,
+      description: `Stock: ${remaining} | ${formatBRL(final)}${disc > 0 ? ` (-${disc}%)` : ""}${
+        it.popular ? " | MOST POPULAR" : ""
+      }`,
       default: it.id === selectedItemId,
       emoji: it.popular ? "🔥" : undefined,
     };
@@ -243,6 +305,29 @@ function itemSelectRow(shopKey, selectedItemId, disabled = false) {
       .setDisabled(disabled)
       .addOptions(options.slice(0, 25))
   );
+}
+
+function vouchCountSelectRow() {
+  return new Discord.MessageActionRow().addComponents(
+    new Discord.MessageSelectMenu()
+      .setCustomId("vouch_count")
+      .setPlaceholder("How many vouches do you want to see?")
+      .addOptions([
+        { label: "Up to 5 vouches", value: "5", description: "Show the latest 5 anonymous vouches" },
+        { label: "Up to 10 vouches", value: "10", description: "Show the latest 10 anonymous vouches" },
+        { label: "Up to 100 vouches", value: "100", description: "Show the latest 100 anonymous vouches" },
+      ])
+  );
+}
+
+function vouchStarsRow() {
+  const mk = (n) =>
+    new Discord.MessageButton()
+      .setCustomId(`vouch_star_${n}`)
+      .setLabel(`${"⭐".repeat(n)}`)
+      .setStyle(n >= 4 ? "SUCCESS" : n === 3 ? "PRIMARY" : "SECONDARY");
+
+  return new Discord.MessageActionRow().addComponents(mk(1), mk(2), mk(3), mk(4), mk(5));
 }
 
 // ======================
@@ -382,7 +467,7 @@ function releaseReservation(channelId, reason = "expired") {
   return { shopKey, itemId, qty, reason };
 }
 
-async function notifyReservationReleased(guild, channelId, payload) {
+async function notifyReservationReleased(guild, channelId) {
   try {
     const ch = await guild.channels.fetch(channelId).catch(() => null);
     if (!ch) return;
@@ -404,7 +489,7 @@ function startReservationTimersOnce(guild, channelId, ms) {
   clearReserveTimer(order);
   order.reserveTimer = setTimeout(async () => {
     const released = releaseReservation(channelId, "expired");
-    if (released) await notifyReservationReleased(guild, channelId, released);
+    if (released) await notifyReservationReleased(guild, channelId);
   }, ms);
 
   channelOrder.set(channelId, order);
@@ -446,6 +531,76 @@ function startLiveCountdownOnce(guild, channelId) {
 }
 
 // ======================
+// VOUCH FLOW (interactive stars + comment)
+// ======================
+async function promptVouch(guild, channelId, userId) {
+  try {
+    const ch = await guild.channels.fetch(channelId).catch(() => null);
+    if (!ch) return;
+
+    await ch.send({
+      content:
+        `⭐ **Rate your experience (anonymous)**\n` +
+        `Click a star below (1–5). Then you'll type a short comment.\n` +
+        `No username / ID will be shown publicly.`,
+      components: [vouchStarsRow()],
+    });
+  } catch {}
+}
+
+async function collectVouchComment(channel, userId, stars) {
+  pendingVouch.set(userId, { stars, channelId: channel.id, expiresAt: Date.now() + VOUCH_COMMENT_TIMEOUT_MS });
+
+  await channel.send(
+    `📝 **Type your comment now** (max ${MAX_VOUCH_COMMENT_LEN} chars).\n` +
+    `You have **${Math.floor(VOUCH_COMMENT_TIMEOUT_MS / 60000)} minutes**.\n` +
+    `Type \`cancel\` to abort.`
+  );
+
+  const filter = (m) => m.author.id === userId && m.channel.id === channel.id;
+
+  const collector = channel.createMessageCollector({ filter, time: VOUCH_COMMENT_TIMEOUT_MS, max: 1 });
+
+  return new Promise((resolve) => {
+    collector.on("collect", (m) => resolve({ ok: true, message: m }));
+    collector.on("end", (collected) => {
+      if (!collected || collected.size === 0) resolve({ ok: false, message: null });
+    });
+  });
+}
+
+function addAnonymousVouch(stars, comment) {
+  const list = loadVouches();
+  list.unshift({
+    stars: clamp(Number(stars), 1, 5),
+    comment: String(comment).slice(0, MAX_VOUCH_COMMENT_LEN),
+    at: Date.now(),
+    ref: randRef(4),
+  });
+  saveVouches(list);
+}
+
+function buildVouchesEmbed(limit) {
+  const list = loadVouches().slice(0, limit);
+
+  const embed = new Discord.MessageEmbed()
+    .setTitle(`⭐ Anonymous Vouches (Latest ${Math.min(limit, list.length)})`)
+    .setDescription(
+      list.length
+        ? list
+            .map((v, i) => {
+              const when = new Date(v.at).toLocaleString("en-US");
+              return `**${i + 1}.** ${starsLine(v.stars)}  \`#${v.ref}\`\n> ${v.comment}\n🕒 ${when}`;
+            })
+            .join("\n\n")
+        : "No vouches yet."
+    )
+    .setFooter("Shidenn Store • Anonymous reviews");
+
+  return embed;
+}
+
+// ======================
 // ✅ PAYMENT CONFIRMED HOOK (CALL THIS AFTER API CONFIRMS)
 // ======================
 async function onPaymentConfirmed(guild, channelId, details = {}) {
@@ -472,7 +627,7 @@ async function onPaymentConfirmed(guild, channelId, details = {}) {
   const method = order.method ? order.method.toUpperCase() : "UNKNOWN";
 
   await channel.send(
-    `✅ **Payment Confirmed Automatically**\n` +
+    `✅ **Payment Confirmed**\n` +
     `Method: **${method}**${tx}\n` +
     `Order: **${CATALOG[order.shopKey].title} — ${it?.name || "Unknown"}**\n` +
     `Qty: **${order.qty}** | Total: **${formatBRL(order.total)}**\n` +
@@ -483,6 +638,9 @@ async function onPaymentConfirmed(guild, channelId, details = {}) {
     const suffix = shortId(order.userId).toLowerCase();
     await channel.setName(`✅paid-${suffix}`.slice(0, 90)).catch(() => {});
   }
+
+  // ⭐ Prompt anonymous vouch after payment confirmed
+  await promptVouch(guild, channelId, order.userId);
 }
 
 // ======================
@@ -510,6 +668,8 @@ const COOLDOWN_KEYS = new Set([
   "pay_crypto",
   "cancel_order",
   "mark_paid",
+  "shidenn_about",
+  "shidenn_vouches",
 ]);
 
 // ======================
@@ -522,6 +682,7 @@ client.once("ready", () => {
   mustEnv("STAFF_ROLE_ID");
   mustEnv("ISOLADO_ROLE_ID");
 
+  ensureVouchesFile();
   initStockFromCatalog();
   console.log("📦 Stock initialized from catalog.");
 });
@@ -548,8 +709,8 @@ client.on("guildMemberAdd", async (member) => {
 
     await lobby.setTopic("📌 start here — private automated support").catch(() => {});
     await lobby.send({
-      content: `📌 **start here**\n\nChoose an option below:`,
-      components: [mainMenuRow()],
+      content: `📌 **Start Here**\n\nChoose an option below:`,
+      components: [mainMenuRow(), infoRow()],
     });
   } catch (err) {
     console.error("❌ ERROR in guildMemberAdd:", err);
@@ -564,10 +725,103 @@ client.on("interactionCreate", async (interaction) => {
     const userId = interaction.user.id;
     const channel = interaction.channel;
 
+    // Cooldown on spam clicks
     if (interaction.isButton() && COOLDOWN_KEYS.has(interaction.customId) && isOnCooldown(userId)) {
       return interaction.reply({ content: "⏳ Please wait 3 seconds before clicking again.", ephemeral: true });
     }
 
+    // ==========
+    // About button (works anywhere)
+    // ==========
+    if (interaction.isButton() && interaction.customId === "shidenn_about") {
+      if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+
+      const embed = new Discord.MessageEmbed()
+        .setTitle("📌 What is Shidenn Store?")
+        .setDescription(
+          "**Shidenn Store** is the first Roblox marketplace built to be **100% anonymous**.\n\n" +
+          "We focus on **fast delivery**, **transparent deals**, and **anonymous vouches**.\n" +
+          "Need help? Click **Contact Support**."
+        )
+        .setFooter("Shidenn Store");
+
+      return interaction.editReply({ embeds: [embed] });
+    }
+
+    // ==========
+    // View vouches button (works anywhere)
+    // ==========
+    if (interaction.isButton() && interaction.customId === "shidenn_vouches") {
+      if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+
+      return interaction.editReply({
+        content: "Select how many anonymous vouches you want to view:",
+        components: [vouchCountSelectRow()],
+      });
+    }
+
+    // Select how many vouches
+    if (interaction.isSelectMenu() && interaction.customId === "vouch_count") {
+      const n = Number(interaction.values?.[0] || "5");
+      const limit = n === 100 ? 100 : n === 10 ? 10 : 5;
+
+      if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+
+      const embed = buildVouchesEmbed(limit);
+      return interaction.editReply({ content: "", embeds: [embed], components: [] });
+    }
+
+    // ==========
+    // Vouch stars (only buyer in that channel should do it)
+    // ==========
+    if (interaction.isButton() && interaction.customId.startsWith("vouch_star_")) {
+      const stars = Number(interaction.customId.split("_").pop());
+      if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+
+      // Only allow if there is an order in this channel and user is the buyer
+      const order = channelOrder.get(channel.id);
+      if (!order || !order.completed) {
+        return interaction.editReply({ content: "⚠️ You can only vouch after a completed order." });
+      }
+      if (order.userId !== userId) {
+        return interaction.editReply({ content: "⚠️ Only the buyer can leave a vouch in this channel." });
+      }
+
+      // prevent spam: if already pending, block
+      const pending = pendingVouch.get(userId);
+      if (pending && pending.channelId === channel.id && pending.expiresAt > Date.now()) {
+        return interaction.editReply({ content: "📝 You already started a vouch. Please type your comment in chat." });
+      }
+
+      // Ask for comment in chat
+      await interaction.editReply({ content: `✅ You selected: **${stars} stars**. Check the channel to type your comment.` });
+
+      const result = await collectVouchComment(channel, userId, stars);
+
+      pendingVouch.delete(userId);
+
+      if (!result.ok || !result.message) {
+        return channel.send("⏳ Vouch timed out. You can click the stars again anytime.");
+      }
+
+      const text = String(result.message.content || "").trim();
+      if (!text || text.toLowerCase() === "cancel") {
+        return channel.send("❌ Vouch cancelled.");
+      }
+
+      const cleaned = text.slice(0, MAX_VOUCH_COMMENT_LEN);
+      addAnonymousVouch(stars, cleaned);
+
+      return channel.send(
+        `✅ **Anonymous vouch saved!**\n` +
+        `Rating: ${starsLine(stars)}\n` +
+        `Comment: "${cleaned}"`
+      );
+    }
+
+    // ==========
+    // From here: only inside managed private channels
+    // ==========
     if (!isManagedChannel(channel)) {
       return interaction.reply({ content: "Use this inside your private channels.", ephemeral: true });
     }
@@ -606,7 +860,7 @@ client.on("interactionCreate", async (interaction) => {
         await hideForUser(channel, userId);
       }
 
-      await lobby.send({ content: "🏠 **Main Menu**", components: [mainMenuRow()] }).catch(() => {});
+      await lobby.send({ content: "🏠 **Main Menu**", components: [mainMenuRow(), infoRow()] }).catch(() => {});
       return interaction.editReply({ content: `✅ Back: ${lobby}` });
     }
 
@@ -828,7 +1082,7 @@ client.on("interactionCreate", async (interaction) => {
         clearReserveTimer(order);
         order.reserveTimer = setTimeout(async () => {
           const released = releaseReservation(channel.id, "expired");
-          if (released) await notifyReservationReleased(interaction.guild, channel.id, released);
+          if (released) await notifyReservationReleased(interaction.guild, channel.id);
         }, methodMs);
       }
 
@@ -847,7 +1101,6 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId === "mark_paid") {
       if (!isStaff && !isAdmin && !isOwner) return interaction.reply({ content: "❌ Staff only.", ephemeral: true });
 
-      // Reuse the same flow as API-confirm, but tag as manual
       await onPaymentConfirmed(interaction.guild, channel.id, { txId: "MANUAL_STAFF_CONFIRM" });
       return interaction.reply({ content: "✅ Marked as paid.", ephemeral: true });
     }
